@@ -9,7 +9,18 @@ from datetime import datetime
 
 from backboard import BackboardClient
 
-API_KEY = os.environ["BACKBOARD_API_KEY"]
+def _load_key():
+    key = os.environ.get("BACKBOARD_API_KEY", "").strip()
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backboard_key.txt")
+    if not key and os.path.exists(path):
+        with open(path) as f:
+            key = f.read().strip()
+    if not key:
+        raise RuntimeError("No Backboard API key. Put it in backboard_key.txt or set BACKBOARD_API_KEY.")
+    return key
+
+
+API_KEY = _load_key()
 
 # Model menu shown in the UI -> (llm_provider, model_name)
 # Check exact names in the Backboard dashboard model list and swap if any 404.
@@ -69,11 +80,13 @@ async def _catch_up(assistant_id: str, user: str, model: str):
     provider, model_name = MODELS[model]
     client = _client()
     r = await client.send_message(
-        f"[{user} via {model}] I'm joining the project now. Give me a quick project status: "
-        "what each teammate has been working on (and with which model), what's done, "
-        "key decisions everyone should stay consistent with, and any open tasks. "
-        "Use the session notes. Keep it under 120 words. Then ask what I want to work on "
-        "today: I might pick up an open task or work on my own part.",
+        f"[{user} via {model}] I'm opening the project. The sidebar already shows everyone's "
+        "status, decisions and history, so do NOT list all of that. Using the session notes, "
+        "tell me only: (1) what changed since my last session (who did it and with which model), "
+        "and (2) anything that affects my part or that I need to stay consistent with. "
+        "Max 3 short sentences, no headings, no bullet lists. If I have no earlier session, "
+        "say in one sentence what the project is about instead. Then ask what I want to work on: "
+        "I might pick up an open task or work on my own part.",
         assistant_id=assistant_id,
         memory="Readonly",  # reading only, don't store the catch-up itself
         llm_provider=provider,
@@ -105,7 +118,7 @@ def chat(assistant_id, thread_id, user, model, text):
     return run(_chat(assistant_id, thread_id, user, model, text))
 
 
-async def _end_session(assistant_id: str, thread_id: str, user: str, model: str) -> str:
+async def _end_session(assistant_id: str, thread_id: str, user: str, model: str) -> dict:
     """Writes a handoff note for the next teammate and stores it in project memory."""
     provider, model_name = MODELS[model]
     client = _client()
@@ -121,23 +134,42 @@ async def _end_session(assistant_id: str, thread_id: str, user: str, model: str)
     )
     stamp = datetime.now().strftime("%b %d %H:%M")
     note = f"SESSION NOTE from {user} (used {model}, {stamp}):\n{r.content}"
-    await client.add_memory(
+    return await _store_note(client, assistant_id, user, model, stamp, note)
+
+
+async def _store_note(client, assistant_id, user, model, stamp, note) -> dict:
+    """Saves the note in Backboard (so every model sees it) and returns a copy for the app.
+    The app keeps that copy because Backboard's auto-memory can later merge or rewrite memories."""
+    res = await client.add_memory(
         assistant_id,
         content=note,
         metadata={"type": "handoff", "author": user, "model": model, "time": stamp},
     )
-    return note
+    mem_id = res.get("memory_id") if isinstance(res, dict) else None
+    return {"id": str(mem_id or ""), "author": user, "model": model, "time": stamp, "text": note}
 
 
 def end_session(assistant_id, thread_id, user, model):
     return run(_end_session(assistant_id, thread_id, user, model))
 
 
+async def _quick_note(assistant_id: str, user: str, model: str, messages: list) -> dict:
+    """Fallback when someone leaves before any reply came back: save what they said, no model call."""
+    stamp = datetime.now().strftime("%b %d %H:%M")
+    said = " | ".join(m.strip() for m in messages if m.strip())[:400]
+    note = f"SESSION NOTE from {user} (used {model}, {stamp}):\nIN PROGRESS: {said}"
+    return await _store_note(_client(), assistant_id, user, model, stamp, note)
+
+
+def quick_note(assistant_id, user, model, messages):
+    return run(_quick_note(assistant_id, user, model, messages))
+
+
 # ---------- memory + files ----------
 
 async def _get_memory(assistant_id: str):
     """Returns (session_notes, facts).
-    session_notes: list of {"author", "model", "time", "text"}; facts: list of strings."""
+    session_notes: list of {"id", "author", "model", "time", "text"}; facts: list of (id, text)."""
     client = _client()
     res = await client.get_memories(assistant_id)
     notes, facts = [], []
@@ -148,13 +180,14 @@ async def _get_memory(assistant_id: str):
             if not author:  # fall back to parsing "SESSION NOTE from Sarah (used ..."
                 author = m.content.split(" from ", 1)[-1].split(" (", 1)[0]
             notes.append({
+                "id": str(m.id),
                 "author": author,
                 "model": meta.get("model", ""),
                 "time": meta.get("time", ""),
                 "text": m.content,
             })
         else:
-            facts.append(m.content)
+            facts.append((str(m.id), m.content))
     return notes, facts
 
 
